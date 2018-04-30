@@ -288,22 +288,19 @@ func (l *cachingMetricsLister) updateMetrics() error {
 	startTime := pmodel.Now().Add(-1 * l.updateInterval)
 
 	// don't do duplicate queries when it's just the matchers that change
-	seriesCacheByQuery := make(map[prom.Selector][]prom.Series)
-	seriesCacheByQueryLock := sync.RWMutex{}
+	seriesCacheByQuery := sync.Map{}
 
 	// these can take a while on large clusters, so launch in parallel
 	// and don't duplicate
-	selectors := make(map[prom.Selector]struct{})
+	selectors := sync.Map{}
 	errs := make(chan error, len(l.namers))
 	for _, namer := range l.namers {
 		sel := namer.Selector()
-		if _, ok := selectors[sel]; ok {
+		if _, ok := selectors.Load(sel); ok {
 			errs <- nil
 			continue
 		}
-		seriesCacheByQueryLock.Lock()
-		selectors[sel] = struct{}{}
-		seriesCacheByQueryLock.Unlock()
+		selectors.Store(sel, struct{}{})
 		go func() {
 			series, err := l.promClient.Series(context.TODO(), pmodel.Interval{startTime, 0}, sel)
 			if err != nil {
@@ -311,9 +308,7 @@ func (l *cachingMetricsLister) updateMetrics() error {
 				return
 			}
 			errs <- nil
-			seriesCacheByQueryLock.Lock()
-			seriesCacheByQuery[sel] = series
-			seriesCacheByQueryLock.Unlock()
+			seriesCacheByQuery.Store(sel, series)
 		}()
 	}
 
@@ -327,11 +322,14 @@ func (l *cachingMetricsLister) updateMetrics() error {
 
 	newSeries := make([][]prom.Series, len(l.namers))
 	for i, namer := range l.namers {
-		series, cached := seriesCacheByQuery[namer.Selector()]
+		series, cached := seriesCacheByQuery.Load(namer.Selector())
 		if !cached {
 			return fmt.Errorf("unable to update list of all metrics: no metrics retrieved for query %q", namer.Selector())
 		}
-		newSeries[i] = namer.FilterSeries(series)
+		if _, ok := series.([]prom.Series); !ok {
+			return fmt.Errorf("unable to update list of all metrics: invalid series in cache for query %q", namer.Selector())
+		}
+		newSeries[i] = namer.FilterSeries(series.([]prom.Series))
 	}
 
 	glog.V(10).Infof("Set available metric list from Prometheus to: %v", newSeries)
